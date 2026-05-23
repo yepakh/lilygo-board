@@ -1,0 +1,8 @@
+CompileFlags:
+  Remove:
+    - -mlongcalls
+    - -fstrict-volatile-bitfields
+    - -mdisable-hardware-atomics
+    - -fno-tree-switch-conversion
+  Add:
+    - --target=xtensa

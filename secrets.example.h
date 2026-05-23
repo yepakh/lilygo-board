@@ -1,0 +1,5 @@
+#define WIFI_SSID ""
+#define WIFI_PASS ""
+#define STOP_ID ""
+#define PLATFORM ""
+#define TIME_ZONE ""
