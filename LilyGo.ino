@@ -8,7 +8,7 @@ const char* ssid = WIFI_SSID;
 const char* pass = WIFI_PASS;
 const char* station_id = STOP_ID;
 const char* platform_filter = PLATFORM;
-const char* time_zone = PLATFORM;
+const char* time_zone = TIME_ZONE;
 
 const char* ntpServer1 = "pool.ntp.org";
 const char* ntpServer2 = "time.nist.gov";
