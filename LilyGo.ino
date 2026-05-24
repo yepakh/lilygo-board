@@ -83,7 +83,7 @@ void setup() {
   }
 
   configTzTime(time_zone, ntpServer1, ntpServer2);
-  // processButtonPress();
+  epd_poweroff_all();
 }
 
 void loop() {
@@ -117,18 +117,23 @@ void processButtonPress() {
 
   int32_t cursor_x = 10;
   int32_t cursor_y = 40;
-
   String station_title = get_station_title(info);
   Serial.println(station_title);
   write_string((GFXfont*)&FiraSans, station_title.c_str(), &cursor_x, &cursor_y, NULL);
 
+  cursor_x = 10;
+  cursor_y = 80;
+  String curr_time = get_current_time();
+  Serial.println(curr_time);
+  write_string((GFXfont*)&FiraSans, curr_time.c_str(), &cursor_x, &cursor_y, NULL);
+
   cursor_x = 100;
-  cursor_y = 100;
+  cursor_y = 200;
   String departs = get_departures(info);
   Serial.println(departs);
   write_string((GFXfont*)&FiraSans, departs.c_str(), &cursor_x, &cursor_y, NULL);
 
-  epd_poweroff();
+  epd_poweroff_all();
   Serial.println("processButtonPress end");
 }
 
@@ -220,10 +225,10 @@ String get_departures(const StationInfo& info) {
 
 String get_departure_info(const Departure& dep) {
   String diffStr = "+0'";
-  int diff = dep.real_time - dep.scheduled_time / 60;
+  int diff = (dep.real_time - dep.scheduled_time) / 60;
   if (dep.real_time == 0) {
     diffStr = "?";
-  } else if (diff = 0) {
+  } else if (diff == 0) {
     String diffStr = String(diff);
 
     if (diff > 0) {
@@ -232,7 +237,7 @@ String get_departure_info(const Departure& dep) {
   }
 
   char buf[256];
-  int bytesWritten = snprintf(buf, sizeof(buf), "%s - %s: %s(%s)", dep.line_name.c_str(), dep.direction.c_str(), get_time_string(dep.scheduled_time).c_str(), diffStr.c_str());
+  int bytesWritten = snprintf(buf, sizeof(buf), "%s - %s: %s(%s)", dep.line_name.c_str(), dep.direction.c_str(), get_short_time_string(dep.scheduled_time).c_str(), diffStr.c_str());
   return buf;
 }
 
@@ -274,6 +279,22 @@ String get_time_string(const time_t& seconds) {
   char time_buf[64];
   strftime(time_buf, sizeof(time_buf), "%b %d, %a %R", time);
   return time_buf;
+}
+
+String get_short_time_string(const time_t& seconds) {
+  tm* time = localtime(&seconds);
+  if (!time) return "";
+
+  char time_buf[8];
+  strftime(time_buf, sizeof(time_buf), "%R", time);
+  return time_buf;
+}
+
+
+String get_current_time() {
+  time_t now;
+  time(&now);
+  return get_time_string(now);
 }
 
 void log_memory(String pref) {
