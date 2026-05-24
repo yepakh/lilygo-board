@@ -1,2 +1,2 @@
-default_fqbn: esp32:esp32:esp32s3:CDCOnBoot=cdc
+default_fqbn: esp32:esp32:esp32s3:CDCOnBoot=cdc,PSRAM=opi
 default_port: /dev/ttyACM0

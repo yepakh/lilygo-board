@@ -3,6 +3,8 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include "time.h"
+#include "epd_driver.h"
+#include "firasans.h"
 
 const char* ssid = WIFI_SSID;
 const char* pass = WIFI_PASS;
@@ -15,12 +17,14 @@ const char* ntpServer2 = "time.nist.gov";
 const unsigned int dep_limit = 8;
 const int BUTTON_PIN = 21;
 
+uint8_t* framebuffer;
+
 struct Departure {
   String line_name;
   String direction;
   String platform;
-  String scheduled_time;
-  String real_time;
+  time_t scheduled_time;
+  time_t real_time;
   String state;
 };
 
@@ -36,7 +40,31 @@ void setup() {
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
+  Serial.printf("Before framebuffer - Heap free: %u, PSRAM free: %u\n",
+                heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
+                heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+  epd_init();
+
+  framebuffer = (uint8_t*)heap_caps_malloc(EPD_WIDTH * EPD_HEIGHT / 2, MALLOC_CAP_SPIRAM);
+  if (!framebuffer) {
+    for (;;) {
+      Serial.println("Failed to allocate framebuffer!");
+      delay(100);
+    };  // halt
+  }
+  memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+
+  Serial.printf("After framebuffer - Heap free: %u, PSRAM free: %u\n",
+                heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
+                heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
   WiFi.begin(ssid, pass);
+
+  Serial.printf("After WiFi.begin - Heap free: %u, PSRAM free: %u\n",
+                heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
+                heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
   unsigned long start = millis();
   const unsigned long timeout = 10000;
 
@@ -58,9 +86,7 @@ void setup() {
   }
 
   configTzTime(time_zone, ntpServer1, ntpServer2);
-  String json = requestStationInfo();
-  StationInfo info = parse_station_info(json);
-  print_station_info(info);
+  processButtonPress();
 }
 
 void loop() {
@@ -68,13 +94,32 @@ void loop() {
   bool pressed = digitalRead(BUTTON_PIN) == LOW;
 
   if (pressed && !last_pressed) {
-    String json = requestStationInfo();
-    StationInfo info = parse_station_info(json);
-    print_station_info(info);
+    processButtonPress();
   }
 
   last_pressed = pressed;
   delay(20);  // crude debounce
+}
+
+void processButtonPress() {
+  Serial.println("processButtonPress start");
+
+  if (!framebuffer) {
+    Serial.println("framebuffer is NULL!");
+    return;
+  }
+
+  epd_poweron();
+  epd_clear();
+
+  Serial.println("before write_string");
+  write_string((GFXfont*)&FiraSans, "Hello, bus!", 0, 0, framebuffer);
+  Serial.println("after write_string, before epd_write_line");
+  epd_write_line(0, 0, 10, 0, 255, framebuffer);
+  Serial.println("after epd_write_line");
+
+  epd_poweroff();
+  Serial.println("processButtonPress end");
 }
 
 String requestStationInfo() {
@@ -117,8 +162,8 @@ StationInfo parse_station_info(String input) {
     return StationInfo{};
   }
 
-  info.name = String(doc["Name"]);
-  info.place = String(doc["Place"]);
+  info.name = doc["Name"].as<String>();
+  info.place = doc["Place"].as<String>();
 
   for (JsonObject departure : doc["Departures"].as<JsonArray>()) {
     if (info.count >= dep_limit) {
@@ -133,11 +178,11 @@ StationInfo parse_station_info(String input) {
     Departure dep;
 
     dep.platform = String(platform_name ? platform_name : "");
-    dep.line_name = String(departure["LineName"]);
-    dep.direction = String(departure["Direction"]);
-    dep.real_time = String(departure["RealTime"]);
-    dep.scheduled_time = String(departure["ScheduledTime"]);
-    dep.state = String(departure["State"]);
+    dep.line_name = departure["LineName"].as<String>();
+    dep.direction = departure["Direction"].as<String>();
+    dep.real_time = convert_ms_timestamp(departure["RealTime"]);
+    dep.scheduled_time = convert_ms_timestamp(departure["ScheduledTime"]);
+    dep.state = departure["State"].as<String>();
 
     info.departure[info.count++] = dep;
   }
@@ -157,28 +202,30 @@ void print_station_info(const StationInfo& info) {
     Serial.printf("\tDeparture Direction: %s\n", dep.direction.c_str());
     Serial.printf("\tDeparture Platform: %s\n", dep.platform.c_str());
     Serial.printf("\tDeparture State: %s\n", dep.state.c_str());
-    Serial.printf("\tDeparture Scheduled time: %s\n", convert_ms_timestamp(dep.scheduled_time).c_str());
-    Serial.printf("\tDeparture Real time: %s\n\n", convert_ms_timestamp(dep.real_time).c_str());
+    Serial.printf("\tDeparture Scheduled time: %s\n", get_time_string(dep.scheduled_time).c_str());
+    Serial.printf("\tDeparture Real time: %s\n\n", get_time_string(dep.real_time).c_str());
   }
 }
 
-String convert_ms_timestamp(const String& ms_timestamp) {
-  int start_ind = ms_timestamp.indexOf('(');
-  int end_ind = ms_timestamp.indexOf('-');
+time_t convert_ms_timestamp(String ms_timestamp) {
+  int start = ms_timestamp.indexOf('(');
+  int end = ms_timestamp.indexOf('-');
 
-  if (start_ind < 0 || end_ind < 0 || end_ind <= start_ind + 1) {
-    return "";
+  if (start < 0 || end < 0 || end <= start + 1) {
+    return 0;
   }
 
-  String ms_str = ms_timestamp.substring(start_ind + 1, end_ind);
+  String ms_str = ms_timestamp.substring(start + 1, end);
   const char* c = ms_str.c_str();
   long long ms = strtoll(c, nullptr, 10);
-  time_t seconds = ms / 1000;
+  return ms / 1000;
+}
 
+String get_time_string(const time_t& seconds) {
   tm* time = localtime(&seconds);
   if (!time) return "";
 
   char time_buf[64];
   strftime(time_buf, sizeof(time_buf), "%b %d, %a %R", time);
-  return String(time_buf);
+  return time_buf;
 }
