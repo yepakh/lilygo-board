@@ -14,7 +14,8 @@ const char* time_zone = TIME_ZONE;
 
 const char* ntpServer1 = "pool.ntp.org";
 const char* ntpServer2 = "time.nist.gov";
-const unsigned int dep_limit = 8;
+const unsigned int dep_request_limit = 8;
+const unsigned int display_limit = 4;
 const int BUTTON_PIN = 21;
 
 uint8_t* framebuffer;
@@ -31,7 +32,7 @@ struct Departure {
 struct StationInfo {
   String name;
   String place;
-  Departure departure[dep_limit];
+  Departure departure[dep_request_limit];
   unsigned int count = 0;
 };
 
@@ -55,15 +56,11 @@ void setup() {
   }
   memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
 
-  Serial.printf("After framebuffer - Heap free: %u, PSRAM free: %u\n",
-                heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
-                heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  log_memory("After frame buffer - ");
 
   WiFi.begin(ssid, pass);
 
-  Serial.printf("After WiFi.begin - Heap free: %u, PSRAM free: %u\n",
-                heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
-                heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  log_memory("After Wifi begin - ");
 
   unsigned long start = millis();
   const unsigned long timeout = 10000;
@@ -86,7 +83,7 @@ void setup() {
   }
 
   configTzTime(time_zone, ntpServer1, ntpServer2);
-  processButtonPress();
+  // processButtonPress();
 }
 
 void loop() {
@@ -95,6 +92,7 @@ void loop() {
 
   if (pressed && !last_pressed) {
     processButtonPress();
+    log_memory("Button pressed!\n");
   }
 
   last_pressed = pressed;
@@ -112,11 +110,23 @@ void processButtonPress() {
   epd_poweron();
   epd_clear();
 
-  Serial.println("before write_string");
-  write_string((GFXfont*)&FiraSans, "Hello, bus!", 0, 0, framebuffer);
-  Serial.println("after write_string, before epd_write_line");
-  epd_write_line(0, 0, 10, 0, 255, framebuffer);
-  Serial.println("after epd_write_line");
+  String json = requestStationInfo();
+  StationInfo info = parse_station_info(json);
+  Serial.println("Request sent");
+  print_station_info(info);
+
+  int32_t cursor_x = 10;
+  int32_t cursor_y = 40;
+
+  String station_title = get_station_title(info);
+  Serial.println(station_title);
+  write_string((GFXfont*)&FiraSans, station_title.c_str(), &cursor_x, &cursor_y, NULL);
+
+  cursor_x = 100;
+  cursor_y = 100;
+  String departs = get_departures(info);
+  Serial.println(departs);
+  write_string((GFXfont*)&FiraSans, departs.c_str(), &cursor_x, &cursor_y, NULL);
 
   epd_poweroff();
   Serial.println("processButtonPress end");
@@ -126,7 +136,7 @@ String requestStationInfo() {
   HTTPClient http;
 
   char uri[256];  // or bigger if needed
-  snprintf(uri, sizeof(uri), "https://webapi.vvo-online.de/dm?stopid=%s&limit=%u", station_id, dep_limit);
+  snprintf(uri, sizeof(uri), "https://webapi.vvo-online.de/dm?stopid=%s&limit=%u", station_id, dep_request_limit);
   http.begin(uri);
   int httpCode = http.GET();
 
@@ -166,7 +176,7 @@ StationInfo parse_station_info(String input) {
   info.place = doc["Place"].as<String>();
 
   for (JsonObject departure : doc["Departures"].as<JsonArray>()) {
-    if (info.count >= dep_limit) {
+    if (info.count >= dep_request_limit) {
       break;
     }
 
@@ -188,6 +198,42 @@ StationInfo parse_station_info(String input) {
   }
 
   return info;
+}
+
+String get_station_title(const StationInfo& info) {
+  char buf[128];
+  snprintf(buf, sizeof(buf), "%s - %s", info.place.c_str(), info.name.c_str());
+  return buf;
+}
+
+String get_departures(const StationInfo& info) {
+  // const char* buf = (char*)malloc(1024);
+  char buf[1024];
+  unsigned int bytes_written = 0;
+
+  for (int i = 0; i < info.count && i < display_limit; i++) {
+    bytes_written += snprintf(buf + bytes_written, sizeof(buf) - bytes_written, "%u) %s\n", i + 1, get_departure_info(info.departure[i]).c_str());
+  }
+
+  return buf;
+}
+
+String get_departure_info(const Departure& dep) {
+  String diffStr = "+0'";
+  int diff = dep.real_time - dep.scheduled_time / 60;
+  if (dep.real_time == 0) {
+    diffStr = "?";
+  } else if (diff = 0) {
+    String diffStr = String(diff);
+
+    if (diff > 0) {
+      diffStr = '+' + diffStr + '\'';
+    }
+  }
+
+  char buf[256];
+  int bytesWritten = snprintf(buf, sizeof(buf), "%s - %s: %s(%s)", dep.line_name.c_str(), dep.direction.c_str(), get_time_string(dep.scheduled_time).c_str(), diffStr.c_str());
+  return buf;
 }
 
 void print_station_info(const StationInfo& info) {
@@ -228,4 +274,11 @@ String get_time_string(const time_t& seconds) {
   char time_buf[64];
   strftime(time_buf, sizeof(time_buf), "%b %d, %a %R", time);
   return time_buf;
+}
+
+void log_memory(String pref) {
+  Serial.printf("%sHeap free: %u, PSRAM free: %u\n",
+                pref.c_str(),
+                heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
+                heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
