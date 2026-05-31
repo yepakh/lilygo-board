@@ -5,20 +5,33 @@
 #include "time.h"
 #include "epd_driver.h"
 #include "firasans.h"
+#include "esp_adc_cal.h"
 
 const char* ssid = WIFI_SSID;
 const char* pass = WIFI_PASS;
-const char* station_id = STOP_ID;
-const char* platform_filter = PLATFORM;
 const char* time_zone = TIME_ZONE;
 
-const char* ntpServer1 = "pool.ntp.org";
-const char* ntpServer2 = "time.nist.gov";
+const char* station_id_1 = STOP_ID_1;
+const char* platform_1 = PLATFORM_1;
+const char* station_id_2 = STOP_ID_2;
+const char* platform_2 = PLATFORM_2;
+
+const char* ntp_server_1 = "pool.ntp.org";
+const char* ntp_server_2 = "time.nist.gov";
 const unsigned int dep_request_limit = 8;
 const unsigned int display_limit = 4;
 const int BUTTON_PIN = 21;
+int vref = 1100;
 
 uint8_t* framebuffer;
+time_t last_press_time = 0;
+const time_t TIMEOUT = 20;
+
+enum Mode {
+  MODE_1 = 0,
+  MODE_2 = 1,
+  MODE_COUNT
+};
 
 struct Departure {
   String line_name;
@@ -82,24 +95,65 @@ void setup() {
     Serial.println("\nFailed to connect");
   }
 
-  configTzTime(time_zone, ntpServer1, ntpServer2);
-  epd_poweroff_all();
+  configTzTime(time_zone, ntp_server_1, ntp_server_2);
+  delay(500);
+
+  // Correct the ADC reference voltage
+  esp_adc_cal_characteristics_t adc_chars;
+  esp_adc_cal_value_t val_type = esp_adc_cal_characterize(
+    ADC_UNIT_2,
+    ADC_ATTEN_DB_12,
+    ADC_WIDTH_BIT_12,
+    1100,
+    &adc_chars);
+
+  if (val_type == ESP_ADC_CAL_VAL_EFUSE_VREF) {
+    Serial.printf("eFuse Vref: %umV\r\n", adc_chars.vref);
+    vref = adc_chars.vref;
+  }
+
+  processButtonPress(true, station_id_1, platform_1);
 }
 
 void loop() {
-  static bool last_pressed = false;
+  static bool last_pressed_state = false;
+  static Mode active_mode = MODE_1;
   bool pressed = digitalRead(BUTTON_PIN) == LOW;
 
-  if (pressed && !last_pressed) {
-    processButtonPress();
+  if (pressed && !last_pressed_state) {
+    time_t now;
+    time(&now);
+    Serial.printf("Current time: %u\nLast press time: %u\n", now, last_press_time);
+    bool mode_change = now < (last_press_time + TIMEOUT);
+    if (mode_change) {
+      active_mode = switch_mode(active_mode);
+    }
+
+    switch (active_mode) {
+      case MODE_1:
+        processButtonPress(mode_change, station_id_1, platform_1);
+        break;
+      case MODE_2:
+        processButtonPress(mode_change, station_id_2, platform_2);
+        break;
+      default:
+        break;
+    }
+
+    last_press_time = now;
     log_memory("Button pressed!\n");
   }
 
-  last_pressed = pressed;
+  last_pressed_state = pressed;
   delay(20);  // crude debounce
 }
 
-void processButtonPress() {
+Mode switch_mode(Mode current) {
+  int next = (current + 1) % MODE_COUNT;
+  return (Mode)next;
+}
+
+void processButtonPress(bool renderStation, const char* station_id, const char* platform_filter) {
   Serial.println("processButtonPress start");
 
   if (!framebuffer) {
@@ -108,27 +162,43 @@ void processButtonPress() {
   }
 
   epd_poweron();
-  epd_clear();
 
-  String json = requestStationInfo();
-  StationInfo info = parse_station_info(json);
+  if (renderStation) {
+    epd_clear();
+  } else {
+    Rect_t area = { 0, 50, EPD_WIDTH, EPD_HEIGHT - 50 };
+    epd_clear_area(area);
+  }
+
+  String json = requestStationInfo(station_id);
+  StationInfo info = parse_station_info(json, platform_filter);
   Serial.println("Request sent");
   print_station_info(info);
 
-  int32_t cursor_x = 10;
-  int32_t cursor_y = 40;
-  String station_title = get_station_title(info);
-  Serial.println(station_title);
-  write_string((GFXfont*)&FiraSans, station_title.c_str(), &cursor_x, &cursor_y, NULL);
+  int32_t cursor_x;
+  int32_t cursor_y;
+  if (renderStation) {
+    cursor_x = 10;
+    cursor_y = 40;
+    String station_title = get_station_title(info);
+    Serial.println(station_title);
+    write_string((GFXfont*)&FiraSans, station_title.c_str(), &cursor_x, &cursor_y, NULL);
+  }
 
   cursor_x = 10;
-  cursor_y = 80;
+  cursor_y = EPD_HEIGHT - 10;
   String curr_time = get_current_time();
   Serial.println(curr_time);
   write_string((GFXfont*)&FiraSans, curr_time.c_str(), &cursor_x, &cursor_y, NULL);
 
-  cursor_x = 100;
-  cursor_y = 200;
+  cursor_x = EPD_WIDTH - 100;
+  cursor_y = EPD_HEIGHT - 10;
+  String bat_pct = get_battery_pct();
+  Serial.printf("Battery pct: %s\n", bat_pct.c_str());
+  write_string((GFXfont*)&FiraSans, bat_pct.c_str(), &cursor_x, &cursor_y, NULL);
+
+  cursor_x = 50;
+  cursor_y = 100;
   String departs = get_departures(info);
   Serial.println(departs);
   write_string((GFXfont*)&FiraSans, departs.c_str(), &cursor_x, &cursor_y, NULL);
@@ -137,7 +207,21 @@ void processButtonPress() {
   Serial.println("processButtonPress end");
 }
 
-String requestStationInfo() {
+String get_battery_pct() {
+  const float max_vol = 4.2;
+  const float min_vol = 3.3;
+
+  uint16_t v = analogRead(BATT_PIN);
+  float battery_voltage = ((float)v / 4095.0) * 2.0 * 3.3 * (vref / 1000.0);
+  Serial.printf("Battery voltage: %.2f\n", battery_voltage);
+
+  int pct = (battery_voltage - min_vol) * 100 / (max_vol - min_vol);
+  if (pct > 100) pct = 100;
+  if (pct < 0) pct = 0;
+  return String(pct) + "%";
+}
+
+String requestStationInfo(const char* station_id) {
   HTTPClient http;
 
   char uri[256];  // or bigger if needed
@@ -165,7 +249,7 @@ int intlen(unsigned int n) {
   return len;
 }
 
-StationInfo parse_station_info(String input) {
+StationInfo parse_station_info(String input, const char* platform_filter) {
   StationInfo info;
 
   StaticJsonDocument<6144> doc;
@@ -186,7 +270,7 @@ StationInfo parse_station_info(String input) {
     }
 
     const char* platform_name = departure["Platform"]["Name"];
-    if (platform_filter && platform_name && strcmp(platform_filter, platform_name) != 0) {
+    if (platform_filter && platform_filter[0] != '\0' && platform_name && strcmp(platform_filter, platform_name) != 0) {
       continue;
     }
 
@@ -224,12 +308,10 @@ String get_departures(const StationInfo& info) {
 }
 
 String get_departure_info(const Departure& dep) {
-  String diffStr = "+0'";
+  String diffStr;
   int diff = (dep.real_time - dep.scheduled_time) / 60;
-  if (dep.real_time == 0) {
-    diffStr = "?";
-  } else if (diff == 0) {
-    String diffStr = String(diff);
+  if (dep.real_time != 0 && diff != 0) {
+    diffStr = String(diff);
 
     if (diff > 0) {
       diffStr = '+' + diffStr + '\'';
@@ -237,7 +319,11 @@ String get_departure_info(const Departure& dep) {
   }
 
   char buf[256];
-  int bytesWritten = snprintf(buf, sizeof(buf), "%s - %s: %s(%s)", dep.line_name.c_str(), dep.direction.c_str(), get_short_time_string(dep.scheduled_time).c_str(), diffStr.c_str());
+  if (diffStr.length() == 0) {
+    snprintf(buf, sizeof(buf), "%s - %s: %s", dep.line_name.c_str(), dep.direction.c_str(), get_short_time_string(dep.scheduled_time).c_str());
+  } else {
+    snprintf(buf, sizeof(buf), "%s - %s: %s(%s)", dep.line_name.c_str(), dep.direction.c_str(), get_short_time_string(dep.scheduled_time).c_str(), diffStr.c_str());
+  }
   return buf;
 }
 
