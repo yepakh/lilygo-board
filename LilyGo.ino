@@ -6,6 +6,7 @@
 #include "epd_driver.h"
 #include "firasans.h"
 #include "esp_adc_cal.h"
+#include <Preferences.h>
 
 const char* ssid = WIFI_SSID;
 const char* pass = WIFI_PASS;
@@ -18,18 +19,17 @@ const char* platform_2 = PLATFORM_2;
 
 const char* ntp_server_1 = "pool.ntp.org";
 const char* ntp_server_2 = "time.nist.gov";
+const int button_pin = 21;
+const int boot_pin = 0;
 const unsigned int dep_request_limit = 8;
 const unsigned int display_limit = 4;
-const int BUTTON_PIN = 21;
-int vref = 1100;
 
-uint8_t* framebuffer;
-time_t last_press_time = 0;
-const time_t TIMEOUT = 20;
+int vref = 1100;
+Preferences prefs;
 
 enum Mode {
-  MODE_1 = 0,
-  MODE_2 = 1,
+  MODE_0 = 0,
+  MODE_1 = 1,
   MODE_COUNT
 };
 
@@ -52,53 +52,40 @@ struct StationInfo {
 void setup() {
   Serial.begin(115200);
 
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(button_pin, INPUT_PULLUP);
 
-  Serial.printf("Before framebuffer - Heap free: %u, PSRAM free: %u\n",
-                heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
-                heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-
+  prefs.begin("app", false);
   epd_init();
+  correct_refv();
+  connect_to_wifi();
 
-  framebuffer = (uint8_t*)heap_caps_malloc(EPD_WIDTH * EPD_HEIGHT / 2, MALLOC_CAP_SPIRAM);
-  if (!framebuffer) {
-    for (;;) {
-      Serial.println("Failed to allocate framebuffer!");
-      delay(100);
-    };  // halt
+  Mode mode = (Mode)prefs.getInt("mode", 0);
+
+  uint64_t status = esp_sleep_get_ext1_wakeup_status();
+  Serial.printf("Pin wakeup status: %i\n", status);
+  if (status & _BV(button_pin)) {
+    mode = switch_mode((Mode)mode);
+    prefs.putInt("mode", (int)mode);
   }
-  memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+  prefs.end();
 
-  log_memory("After frame buffer - ");
-
-  WiFi.begin(ssid, pass);
-
-  log_memory("After Wifi begin - ");
-
-  unsigned long start = millis();
-  const unsigned long timeout = 10000;
-
-  Serial.print("Connecting to WiFi\n");
-
-  while (WiFi.status() != WL_CONNECTED && millis() - start < timeout) {
-    Serial.print(".");
-    delay(100);
+  Serial.printf("Processing mode: %i\n", mode);
+  switch (mode) {
+    case MODE_0:
+      printStationInfo(station_id_1, platform_1);
+      break;
+    case MODE_1:
+      printStationInfo(station_id_2, platform_2);
+      break;
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nConnected to the WiFi network");
-    Serial.print("Local ESP32 IP: ");
-    Serial.println(WiFi.localIP());
-  } else if (WiFi.status() == WL_NO_SSID_AVAIL) {
-    Serial.println("\nNetwork not found");
-  } else {
-    Serial.println("\nFailed to connect");
-  }
+  WiFi.disconnect(true);
 
-  configTzTime(time_zone, ntp_server_1, ntp_server_2);
-  delay(500);
+  esp_sleep_enable_ext1_wakeup(_BV(boot_pin) | _BV(button_pin), ESP_EXT1_WAKEUP_ANY_LOW);
+  esp_deep_sleep_start();
+}
 
-  // Correct the ADC reference voltage
+void correct_refv() {
   esp_adc_cal_characteristics_t adc_chars;
   esp_adc_cal_value_t val_type = esp_adc_cal_characterize(
     ADC_UNIT_2,
@@ -111,41 +98,89 @@ void setup() {
     Serial.printf("eFuse Vref: %umV\r\n", adc_chars.vref);
     vref = adc_chars.vref;
   }
+}
 
-  processButtonPress(true, station_id_1, platform_1);
+void connect_to_wifi() {
+  String bssid_str = prefs.getString("bssid", "");
+  uint8_t* bssid_ptr = nullptr;
+  uint8_t bssid_bytes[6];
+  if (bssid_str.length() > 0) {
+    // parse "AA:BB:CC:DD:EE:FF" into bytes
+    sscanf(bssid_str.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+           &bssid_bytes[0], &bssid_bytes[1], &bssid_bytes[2],
+           &bssid_bytes[3], &bssid_bytes[4], &bssid_bytes[5]);
+    bssid_ptr = bssid_bytes;
+  }
+
+  bool is_fast_connect = false;
+  if (bssid_ptr != nullptr) {
+    is_fast_connect = true;
+
+    int channel = prefs.getInt("channel");
+    IPAddress ip, gateway, subnet;
+
+    ip.fromString(prefs.getString("ip", ""));
+    gateway.fromString(prefs.getString("gateway", ""));
+    subnet.fromString(prefs.getString("subnet", ""));
+
+    WiFi.config(ip, gateway, subnet, gateway);
+    Serial.print("Fast Connecting to WiFi\n");
+    WiFi.begin(ssid, pass, channel, bssid_ptr);
+  } else {
+    Serial.print("Connecting to WiFi\n");
+    WiFi.begin(ssid, pass);
+  }
+
+  unsigned long start = millis();
+  unsigned long timeout = 1000;
+
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeout) {
+    Serial.print(".");
+    delay(50);
+  }
+
+  if (WiFi.status() != WL_CONNECTED && is_fast_connect) {
+    is_fast_connect = false;
+    WiFi.disconnect();
+    WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
+    WiFi.begin(ssid, pass);
+    Serial.print("Fast connect failed, reconnecting\n");
+    start = millis();
+    timeout = 10000;
+
+    while (WiFi.status() != WL_CONNECTED && millis() - start < timeout) {
+      Serial.print(".");
+      delay(100);
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected to the WiFi network");
+    Serial.print("Local ESP32 IP: ");
+    Serial.println(WiFi.localIP());
+
+    if (!is_fast_connect) {
+      prefs.putString("bssid", WiFi.BSSIDstr());
+      prefs.putInt("channel", WiFi.channel());
+      prefs.putString("ip", WiFi.localIP().toString());
+      prefs.putString("gateway", WiFi.gatewayIP().toString());
+      prefs.putString("subnet", WiFi.subnetMask().toString());
+    }
+
+    configTzTime(time_zone, ntp_server_1, ntp_server_2);
+    time_t now = 0;
+    while (now < 1000000000) {
+      time(&now);
+      delay(50);
+    }
+  } else if (WiFi.status() == WL_NO_SSID_AVAIL) {
+    Serial.println("\nNetwork not found");
+  } else {
+    Serial.println("\nFailed to connect");
+  }
 }
 
 void loop() {
-  static bool last_pressed_state = false;
-  static Mode active_mode = MODE_1;
-  bool pressed = digitalRead(BUTTON_PIN) == LOW;
-
-  if (pressed && !last_pressed_state) {
-    time_t now;
-    time(&now);
-    Serial.printf("Current time: %u\nLast press time: %u\n", now, last_press_time);
-    bool mode_change = now < (last_press_time + TIMEOUT);
-    if (mode_change) {
-      active_mode = switch_mode(active_mode);
-    }
-
-    switch (active_mode) {
-      case MODE_1:
-        processButtonPress(mode_change, station_id_1, platform_1);
-        break;
-      case MODE_2:
-        processButtonPress(mode_change, station_id_2, platform_2);
-        break;
-      default:
-        break;
-    }
-
-    last_press_time = now;
-    log_memory("Button pressed!\n");
-  }
-
-  last_pressed_state = pressed;
-  delay(20);  // crude debounce
 }
 
 Mode switch_mode(Mode current) {
@@ -153,37 +188,30 @@ Mode switch_mode(Mode current) {
   return (Mode)next;
 }
 
-void processButtonPress(bool renderStation, const char* station_id, const char* platform_filter) {
-  Serial.println("processButtonPress start");
+void printStationInfo(const char* station_id, const char* platform_filter) {
+  Serial.println("printStationInfo start");
 
-  if (!framebuffer) {
-    Serial.println("framebuffer is NULL!");
+  epd_poweron();
+  epd_clear();
+
+  String json = request_station_info(station_id);
+  StationInfo info = parse_station_info(json, platform_filter);
+
+  int32_t cursor_x = 10;
+  int32_t cursor_y = 40;
+  if (info.name == "") {
+    Serial.println("Failed to get station info");
+    write_string((GFXfont*)&FiraSans, "Failed to get station info", &cursor_x, &cursor_y, NULL);
+    epd_poweroff_all();
     return;
   }
 
-  epd_poweron();
-
-  if (renderStation) {
-    epd_clear();
-  } else {
-    Rect_t area = { 0, 50, EPD_WIDTH, EPD_HEIGHT - 50 };
-    epd_clear_area(area);
-  }
-
-  String json = requestStationInfo(station_id);
-  StationInfo info = parse_station_info(json, platform_filter);
-  Serial.println("Request sent");
+  Serial.println("Got HTTP Response");
   print_station_info(info);
 
-  int32_t cursor_x;
-  int32_t cursor_y;
-  if (renderStation) {
-    cursor_x = 10;
-    cursor_y = 40;
-    String station_title = get_station_title(info);
-    Serial.println(station_title);
-    write_string((GFXfont*)&FiraSans, station_title.c_str(), &cursor_x, &cursor_y, NULL);
-  }
+  String station_title = get_station_title(info);
+  Serial.println(station_title);
+  write_string((GFXfont*)&FiraSans, station_title.c_str(), &cursor_x, &cursor_y, NULL);
 
   cursor_x = 10;
   cursor_y = EPD_HEIGHT - 10;
@@ -221,13 +249,14 @@ String get_battery_pct() {
   return String(pct) + "%";
 }
 
-String requestStationInfo(const char* station_id) {
+String request_station_info(const char* station_id) {
   HTTPClient http;
 
-  char uri[256];  // or bigger if needed
+  char uri[256];
   snprintf(uri, sizeof(uri), "https://webapi.vvo-online.de/dm?stopid=%s&limit=%u", station_id, dep_request_limit);
   http.begin(uri);
   int httpCode = http.GET();
+  Serial.printf("HTTP code: %d\n", httpCode);
 
   String payload;
   if (httpCode == HTTP_CODE_OK) {
@@ -236,17 +265,6 @@ String requestStationInfo(const char* station_id) {
 
   http.end();
   return payload;
-}
-
-int intlen(unsigned int n) {
-  if (n == 0) return 1;
-  int len = 0;
-  while (n > 0) {
-    len++;
-    n /= 10;
-  }
-
-  return len;
 }
 
 StationInfo parse_station_info(String input, const char* platform_filter) {
@@ -296,8 +314,8 @@ String get_station_title(const StationInfo& info) {
 }
 
 String get_departures(const StationInfo& info) {
-  // const char* buf = (char*)malloc(1024);
   char buf[1024];
+  buf[0] = '\0';
   unsigned int bytes_written = 0;
 
   for (int i = 0; i < info.count && i < display_limit; i++) {
@@ -358,6 +376,12 @@ time_t convert_ms_timestamp(String ms_timestamp) {
   return ms / 1000;
 }
 
+String get_current_time() {
+  time_t now;
+  time(&now);
+  return get_time_string(now);
+}
+
 String get_time_string(const time_t& seconds) {
   tm* time = localtime(&seconds);
   if (!time) return "";
@@ -374,18 +398,4 @@ String get_short_time_string(const time_t& seconds) {
   char time_buf[8];
   strftime(time_buf, sizeof(time_buf), "%R", time);
   return time_buf;
-}
-
-
-String get_current_time() {
-  time_t now;
-  time(&now);
-  return get_time_string(now);
-}
-
-void log_memory(String pref) {
-  Serial.printf("%sHeap free: %u, PSRAM free: %u\n",
-                pref.c_str(),
-                heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
-                heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
