@@ -8,6 +8,8 @@
 #include "esp_adc_cal.h"
 #include <Preferences.h>
 
+// #define DEBUG_VOLTAGE
+
 const char* ssid = WIFI_SSID;
 const char* pass = WIFI_PASS;
 const char* time_zone = TIME_ZONE;
@@ -236,14 +238,28 @@ void printStationInfo(const char* station_id, const char* platform_filter) {
 }
 
 String get_battery_pct() {
-  const float max_vol = 4.2;
-  const float min_vol = 3.3;
+  const float max_vol = 4.35;
+  const float min_vol = 3.5;
 
   uint16_t v = analogRead(BATT_PIN);
   float battery_voltage = ((float)v / 4095.0) * 2.0 * 3.3 * (vref / 1000.0);
   Serial.printf("Battery voltage: %.2f\n", battery_voltage);
 
   int pct = (battery_voltage - min_vol) * 100 / (max_vol - min_vol);
+
+#ifdef DEBUG_VOLTAGE
+  int32_t cursor_x = EPD_WIDTH - 200;
+  int32_t cursor_y = EPD_HEIGHT - 90;
+  char data[32];
+  sprintf(data, "%.2fV", battery_voltage);
+  write_string((GFXfont*)&FiraSans, data, &cursor_x, &cursor_y, NULL);
+
+  cursor_x = EPD_WIDTH - 200;
+  cursor_y = EPD_HEIGHT - 50;
+  sprintf(data, "UP: %i\%", pct);
+  write_string((GFXfont*)&FiraSans, data, &cursor_x, &cursor_y, NULL);
+#endif
+
   if (pct > 100) pct = 100;
   if (pct < 0) pct = 0;
   return String(pct) + "%";
