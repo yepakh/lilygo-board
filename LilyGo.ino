@@ -24,7 +24,8 @@ const char* ntp_server_2 = "time.nist.gov";
 const int button_pin = 21;
 const int boot_pin = 0;
 const unsigned int dep_request_limit = 8;
-const unsigned int display_limit = 4;
+const unsigned int min_display_items = 6;
+const unsigned int max_display_items = 6;
 
 int vref = 1100;
 Preferences prefs;
@@ -47,8 +48,9 @@ struct Departure {
 struct StationInfo {
   String name;
   String place;
-  Departure departure[dep_request_limit];
+  Departure departures[max_display_items];
   unsigned int count = 0;
+  time_t last_ts;
 };
 
 void setup() {
@@ -59,7 +61,6 @@ void setup() {
   prefs.begin("app", false);
   epd_init();
   correct_refv();
-  connect_to_wifi();
 
   Mode mode = (Mode)prefs.getInt("mode", 0);
 
@@ -74,14 +75,12 @@ void setup() {
   Serial.printf("Processing mode: %i\n", mode);
   switch (mode) {
     case MODE_0:
-      printStationInfo(station_id_1, platform_1);
+      process_station_info(station_id_1, platform_1);
       break;
     case MODE_1:
-      printStationInfo(station_id_2, platform_2);
+      process_station_info(station_id_2, platform_2);
       break;
   }
-
-  WiFi.disconnect(true);
 
   esp_sleep_enable_ext1_wakeup(_BV(boot_pin) | _BV(button_pin), ESP_EXT1_WAKEUP_ANY_LOW);
   esp_deep_sleep_start();
@@ -102,7 +101,7 @@ void correct_refv() {
   }
 }
 
-void connect_to_wifi() {
+void wifi_on() {
   String bssid_str = prefs.getString("bssid", "");
   uint8_t* bssid_ptr = nullptr;
   uint8_t bssid_bytes[6];
@@ -126,6 +125,7 @@ void connect_to_wifi() {
     subnet.fromString(prefs.getString("subnet", ""));
 
     WiFi.config(ip, gateway, subnet, gateway);
+
     Serial.print("Fast Connecting to WiFi\n");
     WiFi.begin(ssid, pass, channel, bssid_ptr);
   } else {
@@ -182,22 +182,43 @@ void connect_to_wifi() {
   }
 }
 
-void loop() {
-}
-
 Mode switch_mode(Mode current) {
   int next = (current + 1) % MODE_COUNT;
   return (Mode)next;
 }
 
-void printStationInfo(const char* station_id, const char* platform_filter) {
-  Serial.println("printStationInfo start");
+void process_station_info(const char* station_id, const char* platform_filter) {
+  Serial.println("process_station_info start");
 
   epd_poweron();
   epd_clear();
+  wifi_on();
 
-  String json = request_station_info(station_id);
-  StationInfo info = parse_station_info(json, platform_filter);
+  time_t now;
+  time(&now);
+
+  String json = request_station_info(station_id, now);
+  StationInfo info = parse_station_info(json, platform_filter, max_display_items);
+  Serial.println("Initial station info:\n");
+  log_station_info(info);
+
+  while (info.count < min_display_items) {
+    String extraJson = request_station_info(station_id, info.last_ts);
+    StationInfo extraInfo = parse_station_info(extraJson, platform_filter, max_display_items - info.count);
+    Serial.println("Extra station info:\n");
+    log_station_info(extraInfo);
+
+    int i = 0;
+    for (; i < extraInfo.count && i < max_display_items - info.count; i++) {
+      info.departures[i + info.count] = extraInfo.departures[i];
+    }
+    info.last_ts = extraInfo.last_ts;
+    info.count += i;
+  }
+
+  WiFi.disconnect(true);
+  Serial.println("Total station info:\n");
+  log_station_info(info);
 
   int32_t cursor_x = 10;
   int32_t cursor_y = 40;
@@ -208,8 +229,6 @@ void printStationInfo(const char* station_id, const char* platform_filter) {
     return;
   }
 
-  Serial.println("Got HTTP Response");
-  print_station_info(info);
 
   String station_title = get_station_title(info);
   Serial.println(station_title);
@@ -217,7 +236,7 @@ void printStationInfo(const char* station_id, const char* platform_filter) {
 
   cursor_x = 10;
   cursor_y = EPD_HEIGHT - 10;
-  String curr_time = get_current_time();
+  String curr_time = get_time_string(now);
   Serial.println(curr_time);
   write_string((GFXfont*)&FiraSans, curr_time.c_str(), &cursor_x, &cursor_y, NULL);
 
@@ -265,11 +284,12 @@ String get_battery_pct() {
   return String(pct) + "%";
 }
 
-String request_station_info(const char* station_id) {
+String request_station_info(const char* station_id, time_t timestamp) {
   HTTPClient http;
 
   char uri[256];
-  snprintf(uri, sizeof(uri), "https://webapi.vvo-online.de/dm?stopid=%s&limit=%u", station_id, dep_request_limit);
+  snprintf(uri, sizeof(uri), "https://webapi.vvo-online.de/dm?stopid=%s&limit=%u&time=%s", station_id, dep_request_limit, get_iso_time(timestamp).c_str());
+  Serial.printf("Sending request\n%s\n", uri);
   http.begin(uri);
   int httpCode = http.GET();
   Serial.printf("HTTP code: %d\n", httpCode);
@@ -283,7 +303,7 @@ String request_station_info(const char* station_id) {
   return payload;
 }
 
-StationInfo parse_station_info(String input, const char* platform_filter) {
+StationInfo parse_station_info(String input, const char* platform_filter, int departures_to_parse) {
   StationInfo info;
 
   StaticJsonDocument<6144> doc;
@@ -299,11 +319,13 @@ StationInfo parse_station_info(String input, const char* platform_filter) {
   info.place = doc["Place"].as<String>();
 
   for (JsonObject departure : doc["Departures"].as<JsonArray>()) {
-    if (info.count >= dep_request_limit) {
+    if (info.count >= departures_to_parse) {
       break;
     }
 
     const char* platform_name = departure["Platform"]["Name"];
+    const time_t scheduled_time = convert_ms_timestamp(departure["ScheduledTime"]);
+    info.last_ts = scheduled_time;
     if (platform_filter && platform_filter[0] != '\0' && platform_name && strcmp(platform_filter, platform_name) != 0) {
       continue;
     }
@@ -314,10 +336,10 @@ StationInfo parse_station_info(String input, const char* platform_filter) {
     dep.line_name = departure["LineName"].as<String>();
     dep.direction = departure["Direction"].as<String>();
     dep.real_time = convert_ms_timestamp(departure["RealTime"]);
-    dep.scheduled_time = convert_ms_timestamp(departure["ScheduledTime"]);
+    dep.scheduled_time = scheduled_time;
     dep.state = departure["State"].as<String>();
 
-    info.departure[info.count++] = dep;
+    info.departures[info.count++] = dep;
   }
 
   return info;
@@ -334,8 +356,8 @@ String get_departures(const StationInfo& info) {
   buf[0] = '\0';
   unsigned int bytes_written = 0;
 
-  for (int i = 0; i < info.count && i < display_limit; i++) {
-    bytes_written += snprintf(buf + bytes_written, sizeof(buf) - bytes_written, "%u) %s\n", i + 1, get_departure_info(info.departure[i]).c_str());
+  for (int i = 0; i < info.count && i < max_display_items; i++) {
+    bytes_written += snprintf(buf + bytes_written, sizeof(buf) - bytes_written, "%u) %s\n", i + 1, get_departure_info(info.departures[i]).c_str());
   }
 
   return buf;
@@ -361,13 +383,14 @@ String get_departure_info(const Departure& dep) {
   return buf;
 }
 
-void print_station_info(const StationInfo& info) {
+void log_station_info(const StationInfo& info) {
   Serial.printf("Station Place: %s\n", info.place.c_str());
   Serial.printf("Station Name: %s\n", info.name.c_str());
+  Serial.printf("Station Last time: %s\n\n", get_time_string(info.last_ts).c_str());
   Serial.print("Departures\n");
 
   for (int i = 0; i < info.count; i++) {
-    const Departure& dep = info.departure[i];
+    const Departure& dep = info.departures[i];
 
     Serial.printf("\tDeparture Line: %s\n", dep.line_name.c_str());
     Serial.printf("\tDeparture Direction: %s\n", dep.direction.c_str());
@@ -392,10 +415,13 @@ time_t convert_ms_timestamp(String ms_timestamp) {
   return ms / 1000;
 }
 
-String get_current_time() {
-  time_t now;
-  time(&now);
-  return get_time_string(now);
+String get_iso_time(time_t ts) {
+  tm* time = localtime(&ts);
+  if (!time) return "";
+
+  char time_buf[64];
+  strftime(time_buf, sizeof(time_buf), "%FT%T", time);
+  return time_buf;
 }
 
 String get_time_string(const time_t& seconds) {
@@ -414,4 +440,7 @@ String get_short_time_string(const time_t& seconds) {
   char time_buf[8];
   strftime(time_buf, sizeof(time_buf), "%R", time);
   return time_buf;
+}
+
+void loop() {
 }
