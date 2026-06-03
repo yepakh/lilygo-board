@@ -26,6 +26,7 @@ const int boot_pin = 0;
 const unsigned int dep_request_limit = 8;
 const unsigned int min_display_items = 6;
 const unsigned int max_display_items = 6;
+const unsigned int max_request_count = 4;
 
 int vref = 1100;
 Preferences prefs;
@@ -70,7 +71,6 @@ void setup() {
     mode = switch_mode((Mode)mode);
     prefs.putInt("mode", (int)mode);
   }
-  prefs.end();
 
   Serial.printf("Processing mode: %i\n", mode);
   switch (mode) {
@@ -82,6 +82,7 @@ void setup() {
       break;
   }
 
+  prefs.end();
   esp_sleep_enable_ext1_wakeup(_BV(boot_pin) | _BV(button_pin), ESP_EXT1_WAKEUP_ANY_LOW);
   esp_deep_sleep_start();
 }
@@ -134,7 +135,7 @@ void wifi_on() {
   }
 
   unsigned long start = millis();
-  unsigned long timeout = 1000;
+  unsigned long timeout = 3000;
 
   while (WiFi.status() != WL_CONNECTED && millis() - start < timeout) {
     Serial.print(".");
@@ -201,9 +202,14 @@ void process_station_info(const char* station_id, const char* platform_filter) {
   StationInfo info = parse_station_info(json, platform_filter, max_display_items);
   Serial.println("Initial station info:\n");
   log_station_info(info);
+  int request_counter = 1;
 
-  while (info.count < min_display_items) {
-    String extraJson = request_station_info(station_id, info.last_ts);
+  while (info.count < min_display_items && request_counter++ < max_request_count) {
+    time_t request_ts = info.last_ts;
+    if (info.count > 0 && info.last_ts == info.departures[info.count - 1].scheduled_time) {
+      request_ts += 60;
+    }
+    String extraJson = request_station_info(station_id, request_ts);
     StationInfo extraInfo = parse_station_info(extraJson, platform_filter, max_display_items - info.count);
     Serial.println("Extra station info:\n");
     log_station_info(extraInfo);
@@ -370,8 +376,10 @@ String get_departure_info(const Departure& dep) {
     diffStr = String(diff);
 
     if (diff > 0) {
-      diffStr = '+' + diffStr + '\'';
+      diffStr = '+' + diffStr;
     }
+
+    diffStr += '\'';
   }
 
   char buf[256];
