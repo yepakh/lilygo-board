@@ -23,10 +23,10 @@ const char* ntp_server_1 = "pool.ntp.org";
 const char* ntp_server_2 = "time.nist.gov";
 const int button_pin = 21;
 const int boot_pin = 0;
-const unsigned int dep_request_limit = 8;
+const unsigned int departures_per_request = 8;
+const unsigned int max_request_count = 4;
 const unsigned int min_display_items = 6;
 const unsigned int max_display_items = 6;
-const unsigned int max_request_count = 4;
 
 int vref = 1100;
 Preferences prefs;
@@ -51,7 +51,7 @@ struct StationInfo {
   String place;
   Departure departures[max_display_items];
   unsigned int count = 0;
-  time_t last_ts;
+  time_t last_ts = 0;
 };
 
 void setup() {
@@ -170,9 +170,11 @@ void wifi_on() {
       prefs.putString("subnet", WiFi.subnetMask().toString());
     }
 
+    unsigned long start = millis();
+    unsigned long timeout = 5000;
     configTzTime(time_zone, ntp_server_1, ntp_server_2);
     time_t now = 0;
-    while (now < 1000000000) {
+    while (now < 1000000000 && millis() - start < timeout) {
       time(&now);
       delay(50);
     }
@@ -198,32 +200,10 @@ void process_station_info(const char* station_id, const char* platform_filter) {
   time_t now;
   time(&now);
 
+  // get first part of request
   String json = request_station_info(station_id, now);
   StationInfo info = parse_station_info(json, platform_filter, max_display_items);
   Serial.println("Initial station info:\n");
-  log_station_info(info);
-  int request_counter = 1;
-
-  while (info.count < min_display_items && request_counter++ < max_request_count) {
-    time_t request_ts = info.last_ts;
-    if (info.count > 0 && info.last_ts == info.departures[info.count - 1].scheduled_time) {
-      request_ts += 60;
-    }
-    String extraJson = request_station_info(station_id, request_ts);
-    StationInfo extraInfo = parse_station_info(extraJson, platform_filter, max_display_items - info.count);
-    Serial.println("Extra station info:\n");
-    log_station_info(extraInfo);
-
-    int i = 0;
-    for (; i < extraInfo.count && i < max_display_items - info.count; i++) {
-      info.departures[i + info.count] = extraInfo.departures[i];
-    }
-    info.last_ts = extraInfo.last_ts;
-    info.count += i;
-  }
-
-  WiFi.disconnect(true);
-  Serial.println("Total station info:\n");
   log_station_info(info);
 
   int32_t cursor_x = 10;
@@ -231,32 +211,65 @@ void process_station_info(const char* station_id, const char* platform_filter) {
   if (info.name == "") {
     Serial.println("Failed to get station info");
     write_string((GFXfont*)&FiraSans, "Failed to get station info", &cursor_x, &cursor_y, NULL);
+    WiFi.disconnect(true);
     epd_poweroff_all();
     return;
   }
 
-
+  //print the title
   String station_title = get_station_title(info);
   Serial.println(station_title);
   write_string((GFXfont*)&FiraSans, station_title.c_str(), &cursor_x, &cursor_y, NULL);
 
+  //print the time
   cursor_x = 10;
   cursor_y = EPD_HEIGHT - 10;
   String curr_time = get_time_string(now);
   Serial.println(curr_time);
   write_string((GFXfont*)&FiraSans, curr_time.c_str(), &cursor_x, &cursor_y, NULL);
 
+  //print the battery
   cursor_x = EPD_WIDTH - 100;
   cursor_y = EPD_HEIGHT - 10;
   String bat_pct = get_battery_pct();
   Serial.printf("Battery pct: %s\n", bat_pct.c_str());
   write_string((GFXfont*)&FiraSans, bat_pct.c_str(), &cursor_x, &cursor_y, NULL);
 
+  //print first batch of departure
   cursor_x = 50;
   cursor_y = 100;
-  String departs = get_departures(info);
+  String departs = get_departures(info, 1, max_display_items);
   Serial.println(departs);
   write_string((GFXfont*)&FiraSans, departs.c_str(), &cursor_x, &cursor_y, NULL);
+
+  //fetch extra departures
+  int request_counter = 1;
+  int items_count = info.count;
+  time_t last_ts = info.last_ts;
+  if (info.count > 0 && info.last_ts == info.departures[info.count - 1].scheduled_time) {
+    last_ts += 60;
+  }
+
+  while (items_count < min_display_items && request_counter++ < max_request_count) {
+    int items_to_fetch = max_display_items - items_count;
+    json = request_station_info(station_id, last_ts);
+    info = parse_station_info(json, platform_filter, items_to_fetch);
+    Serial.println("Extra station info:\n");
+    log_station_info(info);
+
+    cursor_x = 50;
+    String departs = get_departures(info, items_count + 1, items_to_fetch);
+    Serial.println(departs);
+    write_string((GFXfont*)&FiraSans, departs.c_str(), &cursor_x, &cursor_y, NULL);
+
+    items_count += info.count;
+    last_ts = info.last_ts;
+    if (info.count > 0 && info.last_ts == info.departures[info.count - 1].scheduled_time) {
+      last_ts += 60;
+    }
+  }
+
+  WiFi.disconnect(true);
 
   epd_poweroff_all();
   Serial.println("processButtonPress end");
@@ -294,7 +307,7 @@ String request_station_info(const char* station_id, time_t timestamp) {
   HTTPClient http;
 
   char uri[256];
-  snprintf(uri, sizeof(uri), "https://webapi.vvo-online.de/dm?stopid=%s&limit=%u&time=%s", station_id, dep_request_limit, get_iso_time(timestamp).c_str());
+  snprintf(uri, sizeof(uri), "https://webapi.vvo-online.de/dm?stopid=%s&limit=%u&time=%s", station_id, departures_per_request, get_iso_time(timestamp).c_str());
   Serial.printf("Sending request\n%s\n", uri);
   http.begin(uri);
   int httpCode = http.GET();
@@ -357,13 +370,13 @@ String get_station_title(const StationInfo& info) {
   return buf;
 }
 
-String get_departures(const StationInfo& info) {
+String get_departures(const StationInfo& info, unsigned int start_ind, unsigned int max_count) {
   char buf[1024];
   buf[0] = '\0';
   unsigned int bytes_written = 0;
 
-  for (int i = 0; i < info.count && i < max_display_items; i++) {
-    bytes_written += snprintf(buf + bytes_written, sizeof(buf) - bytes_written, "%u) %s\n", i + 1, get_departure_info(info.departures[i]).c_str());
+  for (int i = 0; i < info.count && i < max_count; i++) {
+    bytes_written += snprintf(buf + bytes_written, sizeof(buf) - bytes_written, "%u) %s\n", i + start_ind, get_departure_info(info.departures[i]).c_str());
   }
 
   return buf;
