@@ -54,8 +54,48 @@ struct StationInfo {
   time_t last_ts = 0;
 };
 
+typedef enum {
+  TURN_ON,
+  TURN_OFF,
+  CLEAR,
+  PRINT_TEXT,
+} UI_Action;
+
+void TaskPrintOnScreen(void* pvParameters);
+TaskHandle_t display_task_handle;
+TaskHandle_t app_task_handle;
+QueueHandle_t QueueHandle;
+typedef struct {
+  UI_Action Action;
+  char Text[512];
+  int32_t Cursor_X;
+  int32_t Cursor_Y;
+} message_t;
+
 void setup() {
   Serial.begin(115200);
+  Serial.printf("setup core: %d\n", xPortGetCoreID());
+  QueueHandle = xQueueCreate(10, sizeof(message_t));
+
+  // Check if the queue was successfully created
+  if (QueueHandle == NULL) {
+    Serial.println("Queue could not be created. Halt.");
+    while (1) {
+      delay(1000);  // Halt at this point as is not possible to continue
+    }
+  }
+
+  app_task_handle = xTaskGetCurrentTaskHandle();
+  // This variant of task creation can also specify on which core it will be run (only relevant for multi-core ESPs)
+  xTaskCreatePinnedToCore(
+    TaskPrintOnScreen,
+    "Priting the data to display",
+    1024 * 8,              // Stack size
+    NULL,                  // When no parameter is used, simply pass NULL
+    2,                     // Priority
+    &display_task_handle,  // With task handle we will be able to manipulate with this task.
+    0                      // Core on which the task will run
+  );
 
   pinMode(button_pin, INPUT_PULLUP);
 
@@ -66,7 +106,7 @@ void setup() {
   Mode mode = (Mode)prefs.getInt("mode", 0);
 
   uint64_t status = esp_sleep_get_ext1_wakeup_status();
-  Serial.printf("Pin wakeup status: %i\n", status);
+  Serial.printf("Pin wakeup status: %llu\n", status);
   if (status & _BV(button_pin)) {
     mode = switch_mode((Mode)mode);
     prefs.putInt("mode", (int)mode);
@@ -87,6 +127,36 @@ void setup() {
   esp_deep_sleep_start();
 }
 
+void TaskPrintOnScreen(void* pvParamters) {
+  Serial.printf("display task core: %d\n", xPortGetCoreID());
+  message_t message;
+  int32_t cursor_x = 0;
+  int32_t cursor_y = 0;
+
+  for (;;) {
+    if (xQueueReceive(QueueHandle, &message, portMAX_DELAY) == pdTRUE) {
+      switch (message.Action) {
+        case TURN_ON:
+          Serial.println("Handling Screen ON Request.");
+          epd_poweron();
+          epd_clear();
+          break;
+        case TURN_OFF:
+          Serial.println("Handling Screen Off Request.");
+          epd_poweroff_all();
+          xTaskNotifyGive(app_task_handle);
+          break;
+        case PRINT_TEXT:
+          Serial.println("Handling Screen Print Request.");
+          if (message.Cursor_X >= 0) cursor_x = message.Cursor_X;
+          if (message.Cursor_Y >= 0) cursor_y = message.Cursor_Y;
+          write_string((GFXfont*)&FiraSans, message.Text, &cursor_x, &cursor_y, NULL);
+          break;
+      }
+    }
+  }
+}
+
 void correct_refv() {
   esp_adc_cal_characteristics_t adc_chars;
   esp_adc_cal_value_t val_type = esp_adc_cal_characterize(
@@ -103,36 +173,7 @@ void correct_refv() {
 }
 
 void wifi_on() {
-  String bssid_str = prefs.getString("bssid", "");
-  uint8_t* bssid_ptr = nullptr;
-  uint8_t bssid_bytes[6];
-  if (bssid_str.length() > 0) {
-    // parse "AA:BB:CC:DD:EE:FF" into bytes
-    sscanf(bssid_str.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-           &bssid_bytes[0], &bssid_bytes[1], &bssid_bytes[2],
-           &bssid_bytes[3], &bssid_bytes[4], &bssid_bytes[5]);
-    bssid_ptr = bssid_bytes;
-  }
-
-  bool is_fast_connect = false;
-  if (bssid_ptr != nullptr) {
-    is_fast_connect = true;
-
-    int channel = prefs.getInt("channel");
-    IPAddress ip, gateway, subnet;
-
-    ip.fromString(prefs.getString("ip", ""));
-    gateway.fromString(prefs.getString("gateway", ""));
-    subnet.fromString(prefs.getString("subnet", ""));
-
-    WiFi.config(ip, gateway, subnet, gateway);
-
-    Serial.print("Fast Connecting to WiFi\n");
-    WiFi.begin(ssid, pass, channel, bssid_ptr);
-  } else {
-    Serial.print("Connecting to WiFi\n");
-    WiFi.begin(ssid, pass);
-  }
+  bool is_fast_connect = wifi_begin();
 
   unsigned long start = millis();
   unsigned long timeout = 3000;
@@ -185,6 +226,33 @@ void wifi_on() {
   }
 }
 
+bool wifi_begin() {
+  String bssid_str = prefs.getString("bssid", "");
+  if (bssid_str.length() == 0) {
+    Serial.print("Connecting to WiFi\n");
+    WiFi.begin(ssid, pass);
+    return false;
+  }
+  // parse "AA:BB:CC:DD:EE:FF" into bytes
+  uint8_t bssid_bytes[6];
+  sscanf(bssid_str.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+         &bssid_bytes[0], &bssid_bytes[1], &bssid_bytes[2],
+         &bssid_bytes[3], &bssid_bytes[4], &bssid_bytes[5]);
+
+  int channel = prefs.getInt("channel");
+  IPAddress ip, gateway, subnet;
+
+  ip.fromString(prefs.getString("ip", ""));
+  gateway.fromString(prefs.getString("gateway", ""));
+  subnet.fromString(prefs.getString("subnet", ""));
+
+  WiFi.config(ip, gateway, subnet, gateway);
+
+  Serial.print("Fast Connecting to WiFi\n");
+  WiFi.begin(ssid, pass, channel, bssid_bytes);
+  return true;
+}
+
 Mode switch_mode(Mode current) {
   int next = (current + 1) % MODE_COUNT;
   return (Mode)next;
@@ -193,9 +261,10 @@ Mode switch_mode(Mode current) {
 void process_station_info(const char* station_id, const char* platform_filter) {
   Serial.println("process_station_info start");
 
-  epd_poweron();
-  epd_clear();
   wifi_on();
+  message_t turn_on = { TURN_ON, {}, 0, 0 };
+  int ret = xQueueSend(QueueHandle, (void*)&turn_on, 0);
+  taskYIELD();
 
   time_t now;
   time(&now);
@@ -206,41 +275,51 @@ void process_station_info(const char* station_id, const char* platform_filter) {
   Serial.println("Initial station info:\n");
   log_station_info(info);
 
-  int32_t cursor_x = 10;
-  int32_t cursor_y = 40;
+  message_t m_init = { PRINT_TEXT, {}, 10, 40 };
   if (info.name == "") {
     Serial.println("Failed to get station info");
-    write_string((GFXfont*)&FiraSans, "Failed to get station info", &cursor_x, &cursor_y, NULL);
+    strncpy(m_init.Text, "Failed to get station info", sizeof(m_init.Text));
+    int ret = xQueueSend(QueueHandle, (void*)&m_init, 0);
+    taskYIELD();
+
     WiFi.disconnect(true);
-    epd_poweroff_all();
+    message_t m_turn_off = { TURN_OFF, {}, 0, 0 };
+    ret = xQueueSend(QueueHandle, (void*)&m_turn_off, 0);
+    taskYIELD();
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     return;
   }
 
   //print the title
   String station_title = get_station_title(info);
   Serial.println(station_title);
-  write_string((GFXfont*)&FiraSans, station_title.c_str(), &cursor_x, &cursor_y, NULL);
+  strncpy(m_init.Text, station_title.c_str(), sizeof(m_init.Text));
+  ret = xQueueSend(QueueHandle, (void*)&m_init, 0);
+  taskYIELD();
 
   //print the time
-  cursor_x = 10;
-  cursor_y = EPD_HEIGHT - 10;
   String curr_time = get_time_string(now);
   Serial.println(curr_time);
-  write_string((GFXfont*)&FiraSans, curr_time.c_str(), &cursor_x, &cursor_y, NULL);
+  message_t m_time = { PRINT_TEXT, {}, 10, EPD_HEIGHT - 10 };
+  strncpy(m_time.Text, curr_time.c_str(), sizeof(m_time.Text));
+  ret = xQueueSend(QueueHandle, (void*)&m_time, 0);
+  taskYIELD();
 
   //print the battery
-  cursor_x = EPD_WIDTH - 100;
-  cursor_y = EPD_HEIGHT - 10;
   String bat_pct = get_battery_pct();
   Serial.printf("Battery pct: %s\n", bat_pct.c_str());
-  write_string((GFXfont*)&FiraSans, bat_pct.c_str(), &cursor_x, &cursor_y, NULL);
+  message_t m_bat = { PRINT_TEXT, {}, EPD_WIDTH - 100, EPD_HEIGHT - 10 };
+  strncpy(m_bat.Text, bat_pct.c_str(), sizeof(m_bat.Text));
+  ret = xQueueSend(QueueHandle, (void*)&m_bat, 0);
+  taskYIELD();
 
   //print first batch of departure
-  cursor_x = 50;
-  cursor_y = 100;
   String departs = get_departures(info, 1, max_display_items);
   Serial.println(departs);
-  write_string((GFXfont*)&FiraSans, departs.c_str(), &cursor_x, &cursor_y, NULL);
+  message_t m_deps = { PRINT_TEXT, {}, 50, 100 };
+  strncpy(m_deps.Text, departs.c_str(), sizeof(m_deps.Text));
+  ret = xQueueSend(QueueHandle, (void*)&m_deps, 0);
+  taskYIELD();
 
   //fetch extra departures
   int request_counter = 1;
@@ -257,10 +336,13 @@ void process_station_info(const char* station_id, const char* platform_filter) {
     Serial.println("Extra station info:\n");
     log_station_info(info);
 
-    cursor_x = 50;
     String departs = get_departures(info, items_count + 1, items_to_fetch);
     Serial.println(departs);
-    write_string((GFXfont*)&FiraSans, departs.c_str(), &cursor_x, &cursor_y, NULL);
+
+    message_t m_extra_deps = { PRINT_TEXT, {}, 50, -1 };
+    strncpy(m_extra_deps.Text, departs.c_str(), sizeof(m_extra_deps.Text));
+    ret = xQueueSend(QueueHandle, (void*)&m_extra_deps, 0);
+    taskYIELD();
 
     items_count += info.count;
     last_ts = info.last_ts;
@@ -271,7 +353,12 @@ void process_station_info(const char* station_id, const char* platform_filter) {
 
   WiFi.disconnect(true);
 
-  epd_poweroff_all();
+  message_t m_off = { TURN_OFF, {}, 0, 0 };
+  ret = xQueueSend(QueueHandle, (void*)&m_off, 0);
+  taskYIELD();
+
+  Serial.println("waiting for display to finish");
+  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
   Serial.println("processButtonPress end");
 }
 
